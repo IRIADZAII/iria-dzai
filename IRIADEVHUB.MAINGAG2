@@ -1,0 +1,704 @@
+--[[
+    iria X Hub — Grow a Garden 2
+    UI: redzlib  | = auto hub
+]]
+
+--========================== SERVICES ==========================--
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local CollectionService = game:GetService("CollectionService")
+local TweenService      = game:GetService("TweenService")
+
+local LP = Players.LocalPlayer
+
+--========================== KILL OLD INSTANCE ==========================--
+if _G.__GAG2HUB and _G.__GAG2HUB.Destroy then
+    pcall(_G.__GAG2HUB.Destroy)
+end
+local SELF = {}
+_G.__GAG2HUB = SELF
+local ALIVE = true
+SELF.Destroy = function() ALIVE = false end
+
+--========================== NETWORKING ==========================--
+local Net, StealFlags, FruitValueCalc
+do
+    local ok, err = pcall(function()
+        Net            = require(ReplicatedStorage.SharedModules.Networking)
+        StealFlags     = require(ReplicatedStorage.SharedModules.Flags.StealFlags)
+        FruitValueCalc = require(ReplicatedStorage.SharedModules.FruitValueCalc)
+    end)
+    if not ok then
+        warn("[IRIA X Hub] Failed to load game API: " .. tostring(err))
+        return
+    end
+end
+
+local function valueOf(m)
+    local name = m:GetAttribute("CorePartName") or m:GetAttribute("SeedName")
+    if not name then return 0 end
+    local ok, v = pcall(FruitValueCalc, name, m:GetAttribute("SizeMulti") or 1,
+        m:GetAttribute("Mutation"), LP, m:GetAttribute("DecayAlpha"))
+    return (ok and type(v) == "number") and v or 0
+end
+
+--========================== STATE ==========================--
+local F = {
+    harvest     = false,
+    prioHarvest = false,
+    plant       = false,
+    plantStack  = false,
+    plantPoint  = nil,
+    sell        = false,
+    steal       = false,
+    prioSteal   = false,
+    antiSteal   = false,
+    eventSeeds  = false,
+    buySeeds    = false,
+    buyGears    = false,
+    buyPets     = false,
+    hopDelay    = 1800,  -- seconds (default 30 min)
+    autoRejoin  = false,
+}
+local seedSelected = {}
+local gearSelected = {}
+
+local busy = false
+local function acquire()
+    local t0 = os.clock()
+    while busy and ALIVE and os.clock() - t0 < 30 do task.wait() end
+    busy = true
+end
+local function release() busy = false end
+
+local function getHRP()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart"), c
+end
+
+local function safeInvoke(packet, ...)
+    local args = table.pack(...)
+    local ok, res = pcall(function()
+        return packet:Fire(table.unpack(args, 1, args.n))
+    end)
+    if ok then return res end
+    return nil
+end
+
+--========================== STOCK / ITEM LISTS ==========================--
+local function stockFolder(shop)
+    local sv = ReplicatedStorage:FindFirstChild("StockValues")
+    local sh = sv and sv:FindFirstChild(shop)
+    return sh and sh:FindFirstChild("Items")
+end
+
+local function listItems(shop)
+    local out, f = {}, stockFolder(shop)
+    if f then
+        for _, v in ipairs(f:GetChildren()) do
+            if v:IsA("ValueBase") then table.insert(out, v.Name) end
+        end
+        table.sort(out)
+    end
+    return out
+end
+
+local seedNames = listItems("SeedShop")
+local gearNames = listItems("GearShop")
+for _, n in ipairs(seedNames) do seedSelected[n] = true end
+for _, n in ipairs(gearNames) do gearSelected[n] = true end
+
+--========================== HELPERS ==========================--
+local function isNight()
+    local lighting = game:GetService("Lighting")
+    local h = lighting.ClockTime
+    return h >= 20 or h < 6
+end
+
+local function groundPointUnder(pos)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Include
+    params.FilterDescendantsInstances = CollectionService:GetTagged("PlantArea")
+    local r = workspace:Raycast(pos + Vector3.new(0, 12, 0), Vector3.new(0, -60, 0), params)
+    return r and r.Position
+end
+
+local function currentStackPoint()
+    if F.plantPoint then return F.plantPoint end
+    local hrp = getHRP()
+    if not hrp then return nil end
+    return groundPointUnder(hrp.Position) or (hrp.Position - Vector3.new(0, 2.5, 0))
+end
+
+--========================== FEATURE LOOPS ==========================--
+
+-- AUTO HARVEST
+local harvestDebounce = {}
+task.spawn(function()
+    while ALIVE do
+        if F.harvest then
+            local myId = LP.UserId
+            local tagged = CollectionService:GetTagged("HarvestPrompt")
+            local list = {}
+            for _, p in ipairs(tagged) do
+                if p:IsA("ProximityPrompt") and p.Parent and p:IsDescendantOf(workspace) then
+                    local m = p.Parent:FindFirstAncestorWhichIsA("Model")
+                    if m and tonumber(m:GetAttribute("UserId")) == myId and m:GetAttribute("PlantId") then
+                        list[#list + 1] = { m = m, v = F.prioHarvest and valueOf(m) or 0 }
+                    end
+                end
+            end
+            if F.prioHarvest then
+                table.sort(list, function(a, b) return a.v > b.v end)
+            end
+            for _, e in ipairs(list) do
+                if not F.harvest then break end
+                local m = e.m
+                local pid = m:GetAttribute("PlantId")
+                local fid = m:GetAttribute("FruitId")
+                local key = tostring(pid) .. "|" .. tostring(fid)
+                local now = os.clock()
+                if not harvestDebounce[key] or now - harvestDebounce[key] > 0.15 then
+                    harvestDebounce[key] = now
+                    pcall(function() Net.Garden.CollectFruit:Fire(pid, fid or "") end)
+                end
+            end
+            if #tagged == 0 then table.clear(harvestDebounce) end
+        end
+        RunService.Heartbeat:Wait()
+    end
+end)
+
+-- AUTO SELL
+task.spawn(function()
+    while ALIVE do
+        if F.sell then
+            local preview = safeInvoke(Net.NPCS.PreviewSellAll)
+            if preview and (preview.FruitCount or 0) > 0 then
+                safeInvoke(Net.NPCS.SellAll)
+            end
+        end
+        task.wait(0.2)
+    end
+end)
+
+-- AUTO PLANT
+local function autoPlantOnce()
+    local plotId = LP:GetAttribute("PlotId")
+    local plot = plotId and workspace:FindFirstChild("Gardens")
+        and workspace.Gardens:FindFirstChild("Plot" .. tostring(plotId))
+    if not plot then return end
+
+    local seedTools = {}
+    local function scan(c)
+        if c then
+            for _, t in ipairs(c:GetChildren()) do
+                if t:IsA("Tool") and t:GetAttribute("SeedTool") ~= nil then
+                    table.insert(seedTools, t)
+                end
+            end
+        end
+    end
+    scan(LP:FindFirstChildOfClass("Backpack"))
+    scan(LP.Character)
+    if #seedTools == 0 then return end
+
+    if F.plantStack then
+        local pt = currentStackPoint()
+        if not pt then return end
+        local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        for _, tool in ipairs(seedTools) do
+            if not (F.plant and F.plantStack) then break end
+            local seedName = tool:GetAttribute("SeedTool")
+            local count = tool:GetAttribute("Count") or 1
+            if hum then pcall(function() hum:EquipTool(tool) end) end
+            for _ = 1, count do
+                if not (F.plant and F.plantStack) or not tool.Parent then break end
+                pcall(function() Net.Plant.PlantSeed:Fire(pt, seedName, tool) end)
+                task.wait(0.07)
+            end
+        end
+        return
+    end
+
+    -- spread mode (spacing)
+    local CELL, MIN2 = 2, 1.3 * 1.3
+    local buckets = {}
+    local function bk(cx, cz) return cx .. "," .. cz end
+    local function addPt(p)
+        local cx, cz = math.floor(p.X / CELL), math.floor(p.Z / CELL)
+        local key = bk(cx, cz)
+        local b = buckets[key]
+        if not b then b = {}; buckets[key] = b end
+        table.insert(b, p)
+    end
+    local function tooClose(p)
+        local cx, cz = math.floor(p.X / CELL), math.floor(p.Z / CELL)
+        for dx = -1, 1 do for dz = -1, 1 do
+            local b = buckets[bk(cx + dx, cz + dz)]
+            if b then for _, q in ipairs(b) do
+                local d = (p - q)
+                if d.X * d.X + d.Z * d.Z < MIN2 then return true end
+            end end
+        end end
+        return false
+    end
+
+    for _, m in ipairs(plot:GetDescendants()) do
+        local pp = m:GetAttribute("PlantPosition")
+        if pp then addPt(pp) end
+    end
+
+    local bounds = plot:FindFirstChild("PlantArea") or plot
+    local cf = bounds:IsA("BasePart") and bounds.CFrame or CFrame.new()
+    local sz = bounds:IsA("BasePart") and bounds.Size or Vector3.new(40, 0, 40)
+    local hx, hz = sz.X / 2 - 1, sz.Z / 2 - 1
+
+    local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+    for _, tool in ipairs(seedTools) do
+        if not F.plant then break end
+        local seedName = tool:GetAttribute("SeedTool")
+        if not seedSelected[seedName] then continue end
+        local count = tool:GetAttribute("Count") or 1
+        if hum then pcall(function() hum:EquipTool(tool) end) end
+        local planted = 0
+        local step = 1.4
+        local function tryPt(pt)
+            if tooClose(pt) then return end
+            addPt(pt)
+            pcall(function() Net.Plant.PlantSeed:Fire(pt, seedName, tool) end)
+            planted += 1
+            task.wait(0.07)
+        end
+        local x = -hx
+        while x <= hx and planted < count and F.plant do
+            local z = -hz
+            while z <= hz and planted < count and F.plant do
+                local world = (cf * CFrame.new(x, 0, z)).Position
+                local ground = groundPointUnder(world)
+                if ground then tryPt(ground) end
+                z += step
+            end
+            x += step
+        end
+        if planted >= count then break end
+    end
+end
+
+task.spawn(function()
+    while ALIVE do
+        if F.plant then
+            autoPlantOnce()
+            task.wait(2)
+        else
+            task.wait(0.5)
+        end
+    end
+end)
+
+-- AUTO STEAL (night only)
+task.spawn(function()
+    while ALIVE do
+        if F.steal and isNight() then
+            local myId = LP.UserId
+            local myPlotId = LP:GetAttribute("PlotId")
+            local list = {}
+            for _, m in ipairs(workspace:GetDescendants()) do
+                if m:IsA("Model") and m:GetAttribute("PlantId")
+                    and tonumber(m:GetAttribute("UserId")) ~= myId then
+                    list[#list + 1] = { m = m, v = F.prioSteal and valueOf(m) or 0 }
+                end
+            end
+            if F.prioSteal then
+                table.sort(list, function(a, b) return a.v > b.v end)
+            end
+            for _, e in ipairs(list) do
+                if not (F.steal and isNight()) then break end
+                local m = e.m
+                local pid = m:GetAttribute("PlantId")
+                local fid = m:GetAttribute("FruitId")
+                if pid and fid then
+                    pcall(function() Net.Garden.StealFruit:Fire(pid, fid) end)
+                    task.wait(0.1)
+                end
+            end
+        end
+        task.wait(0.3)
+    end
+end)
+
+-- ANTI STEAL
+task.spawn(function()
+    while ALIVE do
+        if F.antiSteal and isNight() then
+            local myId   = LP.UserId
+            local myPlot = LP:GetAttribute("PlotId")
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LP and p.Character then
+                    local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+                    -- check if intruder is inside our plot area (simple proximity)
+                    local myHrp = getHRP()
+                    if hrp and myHrp and (hrp.Position - myHrp.Position).Magnitude < 60 then
+                        pcall(function() Net.Combat.HitPlayer:Fire(p) end)
+                    end
+                end
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- AUTO EVENT SEEDS
+task.spawn(function()
+    while ALIVE do
+        if F.eventSeeds then
+            for _, obj in ipairs(CollectionService:GetTagged("EventSeed")) do
+                if obj:IsDescendantOf(workspace) then
+                    local pid = obj:GetAttribute("PlantId") or obj:GetAttribute("SeedId")
+                    if pid then
+                        pcall(function() Net.Events.CollectSeed:Fire(pid) end)
+                    end
+                end
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- AUTO BUY SEEDS
+task.spawn(function()
+    while ALIVE do
+        if F.buySeeds then
+            local items = stockFolder("SeedShop")
+            if items then
+                for _, item in ipairs(items:GetChildren()) do
+                    if item:IsA("ValueBase") and seedSelected[item.Name] and item.Value > 0 then
+                        pcall(function() Net.Shop.BuyItem:Fire("SeedShop", item.Name, 1) end)
+                        task.wait(0.1)
+                    end
+                end
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+-- AUTO BUY GEARS
+task.spawn(function()
+    while ALIVE do
+        if F.buyGears then
+            local items = stockFolder("GearShop")
+            if items then
+                for _, item in ipairs(items:GetChildren()) do
+                    if item:IsA("ValueBase") and gearSelected[item.Name] and item.Value > 0 then
+                        pcall(function() Net.Shop.BuyItem:Fire("GearShop", item.Name, 1) end)
+                        task.wait(0.1)
+                    end
+                end
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+-- AUTO BUY PETS
+task.spawn(function()
+    while ALIVE do
+        if F.buyPets then
+            for _, pet in ipairs(CollectionService:GetTagged("WildPet")) do
+                if pet:IsDescendantOf(workspace) then
+                    local petId = pet:GetAttribute("PetId")
+                    if petId then
+                        pcall(function() Net.Pets.TamePet:Fire(petId) end)
+                        task.wait(0.3)
+                    end
+                end
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+-- AUTO REJOIN / HOP
+task.spawn(function()
+    while ALIVE do
+        if F.autoRejoin then
+            task.wait(F.hopDelay)
+            if F.autoRejoin and ALIVE then
+                pcall(function()
+                    game:GetService("TeleportService"):Teleport(game.PlaceId, LP)
+                end)
+            end
+        else
+            task.wait(5)
+        end
+    end
+end)
+
+--========================== REDZLIB UI ==========================--
+local redzlib = loadstring(game:HttpGet("https://pastefy.app/cpeY3dhp/raw"))()
+local Window = redzlib:MakeWindow({
+    Title      = "IRIA X Hub",
+    SubTitle   = "Grow a Garden 2",
+    SaveFolder = "IRIAIOS_GAG2.json"
+})
+
+local Minimizer = Window:NewMinimizer({ KeyCode = Enum.KeyCode.LeftControl })
+Minimizer:CreateMobileMinimizer({
+    Image             = "rbxassetid://83401629791288",
+    BackgroundColor3  = Color3.fromRGB(25, 25, 25)
+})
+
+--========================== TABS ==========================--
+local Tabs = {
+    Farm     = Window:MakeTab({ Title = "Farm",     Icon = "leaf"       }),
+    Shop     = Window:MakeTab({ Title = "Shop",     Icon = "shopping-bag"}),
+    Misc     = Window:MakeTab({ Title = "Misc",     Icon = "settings"   }),
+    Info     = Window:MakeTab({ Title = "Info",     Icon = "info"       }),
+    Settings = Window:MakeTab({ Title = "Settings", Icon = "settings-2" }),
+}
+
+--========================== FARM TAB ==========================--
+Tabs.Farm:AddSection("Harvest")
+Tabs.Farm:AddToggle({
+    Name     = "Auto Harvest (instant)",
+    Default  = false,
+    Callback = function(v) F.harvest = v end
+})
+Tabs.Farm:AddToggle({
+    Name     = "Harvest Highest Value First",
+    Default  = false,
+    Callback = function(v) F.prioHarvest = v end
+})
+
+Tabs.Farm:AddSection("Plant")
+Tabs.Farm:AddToggle({
+    Name     = "Auto Plant Seeds",
+    Default  = false,
+    Callback = function(v) F.plant = v end
+})
+Tabs.Farm:AddToggle({
+    Name     = "Plant: Stack on One Spot",
+    Default  = false,
+    Callback = function(v) F.plantStack = v end
+})
+Tabs.Farm:AddButton({
+    Name     = "Set Stack Spot (stand on location first)",
+    Callback = function()
+        local hrp = getHRP()
+        if hrp then
+            F.plantPoint = groundPointUnder(hrp.Position)
+                or (hrp.Position - Vector3.new(0, 2.5, 0))
+            print("[IRIA X Hub] Stack spot set:", F.plantPoint)
+        end
+    end
+})
+
+Tabs.Farm:AddSection("Sell")
+Tabs.Farm:AddToggle({
+    Name     = "Auto Sell Inventory",
+    Default  = false,
+    Callback = function(v) F.sell = v end
+})
+
+Tabs.Farm:AddSection("Night & Events")
+Tabs.Farm:AddToggle({
+    Name     = "Auto Steal (Night Only)",
+    Default  = false,
+    Callback = function(v) F.steal = v end
+})
+Tabs.Farm:AddToggle({
+    Name     = "Steal Highest Value First",
+    Default  = false,
+    Callback = function(v) F.prioSteal = v end
+})
+Tabs.Farm:AddToggle({
+    Name     = "Anti-Steal (Hit Intruders)",
+    Default  = false,
+    Callback = function(v) F.antiSteal = v end
+})
+Tabs.Farm:AddToggle({
+    Name     = "Auto Collect Event Seeds",
+    Default  = false,
+    Callback = function(v) F.eventSeeds = v end
+})
+
+--========================== SHOP TAB ==========================--
+Tabs.Shop:AddSection("Seeds")
+Tabs.Shop:AddToggle({
+    Name     = "Auto Buy Seeds",
+    Default  = false,
+    Callback = function(v) F.buySeeds = v end
+})
+
+-- seed checklist as dropdown (multi-select)
+if #seedNames > 0 then
+    Tabs.Shop:AddDropdown({
+        Name     = "Seeds to Buy",
+        Options  = seedNames,
+        Default  = seedNames[1],
+        Callback = function(v)
+            -- single selection toggle in the map
+            seedSelected[v] = not seedSelected[v]
+            print("[IRIA X Hub] Seed toggled:", v, seedSelected[v])
+        end
+    })
+end
+
+Tabs.Shop:AddButton({
+    Name     = "Select ALL Seeds",
+    Callback = function()
+        for _, n in ipairs(seedNames) do seedSelected[n] = true end
+        print("[IRIA X Hub] All seeds selected")
+    end
+})
+Tabs.Shop:AddButton({
+    Name     = "Deselect ALL Seeds",
+    Callback = function()
+        for _, n in ipairs(seedNames) do seedSelected[n] = false end
+        print("[IRIA X Hub] All seeds deselected")
+    end
+})
+
+Tabs.Shop:AddSection("Gears")
+Tabs.Shop:AddToggle({
+    Name     = "Auto Buy Gears",
+    Default  = false,
+    Callback = function(v) F.buyGears = v end
+})
+
+if #gearNames > 0 then
+    Tabs.Shop:AddDropdown({
+        Name     = "Gears to Buy",
+        Options  = gearNames,
+        Default  = gearNames[1],
+        Callback = function(v)
+            gearSelected[v] = not gearSelected[v]
+            print("[IRIA X Hub] Gear toggled:", v, gearSelected[v])
+        end
+    })
+end
+
+Tabs.Shop:AddButton({
+    Name     = "Select ALL Gears",
+    Callback = function()
+        for _, n in ipairs(gearNames) do gearSelected[n] = true end
+    end
+})
+Tabs.Shop:AddButton({
+    Name     = "Deselect ALL Gears",
+    Callback = function()
+        for _, n in ipairs(gearNames) do gearSelected[n] = false end
+    end
+})
+
+Tabs.Shop:AddSection("Pets")
+Tabs.Shop:AddToggle({
+    Name     = "Auto Tame Best Wild Pet",
+    Default  = false,
+    Callback = function(v) F.buyPets = v end
+})
+
+--========================== MISC TAB ==========================--
+Tabs.Misc:AddSection("Server")
+Tabs.Misc:AddTextBox({
+    Name          = "Job ID",
+    Placeholder   = "Paste Job ID here",
+    ClearOnFocus  = true,
+    Callback      = function(v)
+        getgenv().TargetJob = v
+    end
+})
+Tabs.Misc:AddButton({
+    Name     = "Join Job ID",
+    Callback = function()
+        local jid = getgenv().TargetJob
+        if jid and jid ~= "" then
+            game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, jid, LP)
+        end
+    end
+})
+
+Tabs.Misc:AddSection("Links")
+Tabs.Misc:AddButton({
+    Name     = "Copy Discord",
+    Callback = function()
+        setclipboard("https://discord.gg/AtkkDWaKvf")
+        print("[IRIA Hub] Discord link copied!")
+    end
+})
+
+--========================== INFO TAB ==========================--
+Tabs.Info:AddSection("Status")
+-- Live status updated via paragraph refresh
+local function getStatusText()
+    local night = isNight()
+    return string.format(
+        "Player: %s | Night: %s\nHarvest:%s  Sell:%s  Steal:%s\nEvents:%s  BuySeeds:%s  BuyGears:%s",
+        LP.Name,
+        night and "YES" or "no",
+        F.harvest and "ON" or "off",
+        F.sell    and "ON" or "off",
+        F.steal   and "ON" or "off",
+        F.eventSeeds and "ON" or "off",
+        F.buySeeds   and "ON" or "off",
+        F.buyGears   and "ON" or "off"
+    )
+end
+
+Tabs.Info:AddParagraph("Live Status", getStatusText())
+-- refresh button since redzlib paragraphs are static
+Tabs.Info:AddButton({
+    Name     = "Refresh Status",
+    Callback = function()
+        print("[iria X Hub] Status:\n" .. getStatusText())
+    end
+})
+
+Tabs.Info:AddSection("Community")
+Tabs.Info:AddDiscordInvite({
+    Title       = "IRIA HUB IOS",
+    Description = "Script Bad, Steal, =, Pls code, bug 99+",
+    Banner      = "rbxassetid://83401629791288",
+    Logo        = "rbxassetid://83401629791288",
+    Invite      = "https://discord.gg/AtkkDWaKvf",
+    Members     = 3636363636363636,
+    Online      = 676767676767
+})
+
+Tabs.Info:AddParagraph("Version", "v2.0 — GAG2 Edition")
+Tabs.Info:AddParagraph("Status",  "Working")
+
+--========================== SETTINGS TAB ==========================--
+Tabs.Settings:AddSection("Server Hop")
+Tabs.Settings:AddSlider({
+    Name      = "Hop Delay (Minutes)",
+    Min       = 5,
+    Max       = 120,
+    Default   = 30,
+    Increment = 1,
+    Callback  = function(v)
+        F.hopDelay = v * 60
+    end
+})
+Tabs.Settings:AddToggle({
+    Name     = "Auto Rejoin / Hop",
+    Default  = false,
+    Callback = function(v)
+        F.autoRejoin = v
+    end
+})
+
+Tabs.Settings:AddSection("Client")
+Tabs.Settings:AddButton({
+    Name     = "Destroy UI",
+    Callback = function()
+        ALIVE = false
+        local gui = game:GetService("CoreGui"):FindFirstChild("IRIA X Hub")
+        if gui then gui:Destroy() end
+    end
+})
+
+print("[IRIA IOS X Hub] Loaded — GAG2 Edition. Toggle: LEFT CTRL")
